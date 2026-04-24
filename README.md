@@ -66,6 +66,7 @@ ml-intern --model vllm/meta-llama/Llama-3.1-8B-Instruct "your prompt"
 ml-intern --sandbox-tools "your prompt"                         # use HF Space sandbox tools
 ml-intern --max-iterations 100 "your prompt"
 ml-intern --no-stream "your prompt"
+ml-intern --notify-on-block --notify-method auto
 ```
 
 Run `ml-intern` then `/model` to see the full list of suggested model ids
@@ -156,6 +157,11 @@ To override the destination repo, set:
 
 The shared `smolagents/ml-intern-sessions` dataset is unrelated and only
 receives anonymized telemetry rows used by the backend KPI scheduler.
+
+`--notify-on-block` adds an attention ping when the interactive CLI is blocked
+waiting for approval. `--notify-method auto` prefers desktop notifications when
+supported (`osascript` on macOS, `notify-send` on Linux) and falls back to the
+terminal bell.
 
 ## Supported Gateways
 
