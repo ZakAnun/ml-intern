@@ -59,7 +59,7 @@ ml-intern --max-iterations 100 "your prompt"
 ml-intern --no-stream "your prompt"
 ml-intern --notify-on-block --notify-method auto
 # Change model
-ml-intern --model moonshotai/Kimi-K2.6 "your prompt"
+ml-intern --model moonshotai/Kimi-K2.7-Code:novita "your prompt"
 ml-intern --model openai/gpt-5.5:fal-ai "your prompt"
 ```
 
@@ -394,7 +394,7 @@ Edit `configs/cli_agent_config.json` for CLI defaults, or
 
 ```json
 {
-  "model_name": "anthropic/claude-opus-4.8:fal-ai",
+  "model_name": "zai-org/GLM-5.2:novita",
   "mcpServers": {
     "your-server-name": {
       "transport": "http",

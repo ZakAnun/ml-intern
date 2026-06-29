@@ -52,7 +52,7 @@ def _get_max_tokens_safe(model_name: str) -> int:
 
     Primary source: ``litellm.get_model_info(model)['max_input_tokens']``.
     Strips any HF routing suffix / huggingface/ prefix so tagged ids
-    ('moonshotai/Kimi-K2.6:cheapest') look up the bare model. Falls back to a
+    ('moonshotai/Kimi-K2.7-Code:novita') look up the bare model. Falls back to a
     conservative 200k default for models not in the catalog.
     """
     from litellm import get_model_info
@@ -80,7 +80,6 @@ def _get_max_tokens_safe(model_name: str) -> int:
 class OpType(Enum):
     USER_INPUT = "user_input"
     EXEC_APPROVAL = "exec_approval"
-    INTERRUPT = "interrupt"
     UNDO = "undo"
     COMPACT = "compact"
     NEW = "new"
@@ -109,6 +108,7 @@ class Session:
         context_manager: ContextManager | None = None,
         hf_token: str | None = None,
         local_mode: bool = False,
+        autonomous_mode: bool = False,
         stream: bool = True,
         notification_gateway: NotificationGateway | None = None,
         notification_destinations: list[str] | None = None,
@@ -124,6 +124,7 @@ class Session:
         self.hf_username: Optional[str] = hf_username
         self.user_plan: str | None = user_plan
         self.local_mode = local_mode
+        self.autonomous_mode = autonomous_mode
         self.persistence_store = persistence_store
         self.tool_router = tool_router
         self.stream = stream
@@ -136,10 +137,13 @@ class Session:
             untouched_messages=5,
             tool_specs=tool_specs,
             hf_token=hf_token,
+            hf_username=hf_username,
             local_mode=local_mode,
+            autonomous_mode=autonomous_mode,
         )
         self.event_queue = event_queue
         self.session_id = session_id or str(uuid.uuid4())
+        self.inference_billing_session_id: str | None = None
         self.config = config
         self.is_running = True
         self.current_plan: list[dict[str, str]] = []
@@ -157,8 +161,12 @@ class Session:
         self.auto_approval_enabled: bool = False
         self.auto_approval_cost_cap_usd: float | None = None
         self.auto_approval_estimated_spend_usd: float = 0.0
+        self._yolo_budget_reservations: dict[str, Any] = {}
         self.usage_warning_next_threshold_usd: float = USAGE_WARNING_FIRST_THRESHOLD_USD
         self.usage_threshold_checker: Any | None = None
+        self.yolo_budget_checker: Any | None = None
+        self.usage_hf_billing_snapshot: dict[str, Any] | None = None
+        self.usage_metrics: dict[str, Any] | None = None
 
         # Session trajectory logging
         self.logged_events: list[dict] = []
@@ -454,6 +462,7 @@ class Session:
         self.context_manager.running_context_usage = 0
 
         self.session_id = str(uuid.uuid4())
+        self.inference_billing_session_id = None
         self.session_start_time = datetime.now().astimezone().isoformat()
         self.turn_count = 0
         self.last_auto_save_turn = 0
@@ -462,6 +471,9 @@ class Session:
         self._last_heartbeat_ts = None
         self.pending_approval = None
         self.auto_approval_estimated_spend_usd = 0.0
+        self._yolo_budget_reservations = {}
+        self.usage_hf_billing_snapshot = None
+        self.usage_metrics = None
         self.reset_cancel()
 
         # Previous-session metadata is intentionally included for event
@@ -492,7 +504,9 @@ class Session:
             return refresh(
                 tool_specs=tool_specs,
                 hf_token=self.hf_token,
+                hf_username=self.hf_username,
                 local_mode=self.local_mode,
+                autonomous_mode=self.autonomous_mode,
             )
         except Exception as e:
             logger.warning("Failed to refresh system prompt for new chat: %s", e)
@@ -530,6 +544,18 @@ class Session:
             for e in self.logged_events
             if e.get("event_type") == "llm_call"
         )
+        try:
+            from agent.core.usage_metrics import summarize_usage_events
+
+            usage_metrics = summarize_usage_events(
+                self.logged_events,
+                session_id=self.session_id,
+                hf_billing_snapshot=self.usage_hf_billing_snapshot,
+            )
+            self.usage_metrics = usage_metrics
+        except Exception as e:
+            logger.debug("Usage metrics summary failed for %s: %s", self.session_id, e)
+            usage_metrics = self.usage_metrics or {}
         return {
             "session_id": self.session_id,
             "user_id": self.user_id,
@@ -538,6 +564,7 @@ class Session:
             "session_end_time": datetime.now().isoformat(),
             "model_name": self.config.model_name,
             "total_cost_usd": total_cost_usd,
+            "usage_metrics": usage_metrics,
             "messages": [msg.model_dump() for msg in self.context_manager.items],
             "events": self.logged_events,
             "tools": tools,
@@ -608,26 +635,6 @@ class Session:
         except Exception as e:
             logger.error(f"Failed to save session locally: {e}")
             return None
-
-    def update_local_save_status(
-        self, filepath: str, upload_status: str, dataset_url: Optional[str] = None
-    ) -> bool:
-        """Update the upload status of an existing local save file"""
-        try:
-            with open(filepath, "r") as f:
-                data = json.load(f)
-
-            data["upload_status"] = upload_status
-            data["upload_url"] = dataset_url
-            data["last_save_time"] = datetime.now().isoformat()
-
-            with open(filepath, "w") as f:
-                json.dump(data, f, indent=2)
-
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update local save status: {e}")
-            return False
 
     def _personal_trace_repo_id(self) -> Optional[str]:
         """Resolve the per-user trace repo id from config + HF username.

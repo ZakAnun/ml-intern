@@ -58,71 +58,90 @@ from agent.core.llm_params import _resolve_llm_params
 from agent.core.model_ids import (
     CLAUDE_OPUS_48_MODEL_ID,
     DEEPSEEK_V4_PRO_MODEL_ID,
-    GLM_51_MODEL_ID,
+    GLM_52_MODEL_ID,
     GPT_55_MODEL_ID,
-    KIMI_K26_MODEL_ID,
-    MINIMAX_M27_MODEL_ID,
+    KIMI_K27_CODE_MODEL_ID,
+    MINIMAX_M3_MODEL_ID,
     strip_huggingface_model_prefix,
 )
-from usage import build_usage_response, capture_hf_account_usage_baseline
+from agent.core.prompt_caching import with_prompt_cache_params
+from usage import build_usage_response
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["agent"])
-_background_teardown_tasks: set[asyncio.Task] = set()
+_background_route_tasks: set[asyncio.Task] = set()
 
-DEFAULT_OPUS_MODEL_ID = CLAUDE_OPUS_48_MODEL_ID
 DEFAULT_GPT_MODEL_ID = GPT_55_MODEL_ID
-DEFAULT_FREE_MODEL_ID = KIMI_K26_MODEL_ID
+DEFAULT_MODEL_ID = GLM_52_MODEL_ID
 DATASET_UPLOAD_MULTIPART_SLACK_BYTES = 1024 * 1024
 
 
-async def _reset_usage_window_with_hf_baseline(
-    session_id: str,
-    hf_token: str | None,
-) -> dict[str, Any] | None:
-    baseline = await capture_hf_account_usage_baseline(hf_token)
-    captured_at = baseline.get("captured_at") if baseline else None
-    started_at = captured_at if isinstance(captured_at, datetime) else datetime.utcnow()
+async def _reset_usage_window(session_id: str) -> dict[str, Any] | None:
     return await session_manager.reset_session_usage_window(
         session_id,
-        started_at=started_at,
-        baseline=baseline,
+        started_at=datetime.utcnow(),
     )
+
+
+async def _refresh_usage_and_upload(
+    agent_session: AgentSession,
+    *,
+    error_code: str,
+) -> None:
+    session = agent_session.session
+    try:
+        await session_manager.refresh_session_usage_metrics(
+            agent_session,
+            error_code=error_code,
+        )
+        session.save_and_upload_detached(session.config.session_dataset_repo)
+    except Exception as e:
+        logger.warning(
+            "Background usage refresh/upload failed for %s: %s",
+            agent_session.session_id,
+            e,
+        )
+
+
+def _schedule_usage_refresh_and_upload(
+    agent_session: AgentSession,
+    *,
+    error_code: str,
+) -> None:
+    task = asyncio.create_task(
+        _refresh_usage_and_upload(agent_session, error_code=error_code)
+    )
+    _background_route_tasks.add(task)
+    task.add_done_callback(_background_route_tasks.discard)
 
 
 def _available_models() -> list[dict[str, Any]]:
     models = [
         {
-            "id": DEFAULT_OPUS_MODEL_ID,
+            "id": CLAUDE_OPUS_48_MODEL_ID,
             "label": "Claude Opus 4.8",
-            "provider": "huggingface",
-            "recommended": True,
         },
         {
             "id": DEFAULT_GPT_MODEL_ID,
             "label": "GPT-5.5",
-            "provider": "huggingface",
         },
         {
-            "id": DEFAULT_FREE_MODEL_ID,
-            "label": "Kimi K2.6",
-            "provider": "huggingface",
+            "id": KIMI_K27_CODE_MODEL_ID,
+            "label": "Kimi K2.7 Code",
         },
         {
-            "id": MINIMAX_M27_MODEL_ID,
-            "label": "MiniMax M2.7",
-            "provider": "huggingface",
+            "id": MINIMAX_M3_MODEL_ID,
+            "label": "MiniMax M3",
         },
         {
-            "id": GLM_51_MODEL_ID,
-            "label": "GLM 5.1",
-            "provider": "huggingface",
+            "id": DEFAULT_MODEL_ID,
+            "label": "GLM 5.2",
+            "recommended": True,
         },
         {
             "id": DEEPSEEK_V4_PRO_MODEL_ID,
             "label": "DeepSeek V4 Pro",
-            "provider": "huggingface",
         },
     ]
     return models
@@ -141,20 +160,16 @@ def _validate_model_id(model_id: str | None) -> None:
     raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
 
 
-def _default_model_for_user(user: dict[str, Any]) -> str:
-    return DEFAULT_OPUS_MODEL_ID if user.get("plan") == "pro" else DEFAULT_FREE_MODEL_ID
+def _default_model() -> str:
+    return DEFAULT_MODEL_ID
 
 
-async def _model_override_for_new_session(
-    requested_model: str | None,
-    user: dict[str, Any],
-) -> str | None:
+def _model_override_for_new_session(requested_model: str | None) -> str | None:
     """Return the model override to use when creating a new session.
 
-    Explicit model requests are honored. Empty web requests default to Kimi for
-    non-Pro users and Opus for Pro users.
+    Explicit model requests are honored. Empty web requests default to GLM 5.2.
     """
-    return requested_model or _default_model_for_user(user)
+    return requested_model or _default_model()
 
 
 def _user_hf_token(user: dict[str, Any] | None) -> str | None:
@@ -266,18 +281,22 @@ async def health_check() -> HealthResponse:
 
 
 @router.get("/health/llm", response_model=LLMHealthResponse)
-async def llm_health_check(request: Request) -> LLMHealthResponse:
+async def llm_health_check(
+    request: Request,
+    user: dict = Depends(get_current_user),
+) -> LLMHealthResponse:
     """Check if the LLM provider is reachable and the API key is valid.
 
-    Makes a minimal 1-token completion call when a token is available. For
-    token-less HF Router requests, returns ``status="skipped"`` instead of
-    making an unauthenticated probe. Catches common errors:
+    Makes a minimal 1-token completion call against the authenticated user's
+    default model when a token is available. For token-less HF Router requests,
+    returns ``status="skipped"`` instead of making an unauthenticated probe.
+    Catches common errors:
     - 401 → invalid API key
     - 402/insufficient_quota → out of credits
     - 429 → rate limited
     - timeout / network → provider unreachable
     """
-    model = session_manager.config.model_name
+    model = _default_model()
     hf_token = resolve_hf_request_token(request)
     if _model_requires_hf_router_token(model) and not hf_token:
         return LLMHealthResponse(status="skipped", model=model)
@@ -353,11 +372,13 @@ async def generate_title(
     so the 60-token output budget isn't consumed before the title is written.
     """
     try:
+        await _check_session_access(request.session_id, user)
         llm_params = _resolve_llm_params(
             "openai/gpt-oss-120b:cerebras",
             _user_hf_token(user),
             reasoning_effort="low",
         )
+        llm_params = with_prompt_cache_params(llm_params)
         response = await acompletion(
             messages=[
                 {
@@ -382,7 +403,6 @@ async def generate_title(
         if len(title) > 50:
             title = title[:50].rstrip() + "…"
         try:
-            await _check_session_access(request.session_id, user)
             await session_manager.update_session_title(request.session_id, title)
         except Exception:
             logger.debug(
@@ -415,7 +435,7 @@ async def create_session(
     behalf of the user.
 
     Optional body ``{"model"?: <id>}`` selects the session's LLM; unknown
-    ids are rejected (400). Empty requests use the plan-aware web default.
+    ids are rejected (400). Empty requests use the web default.
 
     Returns 503 if the server or user has reached the session limit.
     """
@@ -433,8 +453,8 @@ async def create_session(
 
     _validate_model_id(model)
 
-    # Empty requests use the plan-aware web default.
-    model = await _model_override_for_new_session(model, user)
+    # Empty requests use the web default.
+    model = _model_override_for_new_session(model)
 
     try:
         session_id = await session_manager.create_session(
@@ -448,7 +468,7 @@ async def create_session(
     except SessionCapacityError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    await _reset_usage_window_with_hf_baseline(session_id, hf_token)
+    await _reset_usage_window(session_id)
 
     return SessionResponse(
         session_id=session_id,
@@ -467,7 +487,7 @@ async def restore_session_summary(
     session's context as a user-role system note.
 
     Optional ``"model"`` in the body overrides the session's LLM; otherwise
-    the new session uses the plan-aware web default.
+    the new session uses the web default.
     """
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -478,7 +498,7 @@ async def restore_session_summary(
     model = body.get("model")
     _validate_model_id(model)
 
-    model = await _model_override_for_new_session(model, user)
+    model = _model_override_for_new_session(model)
 
     try:
         session_id = await session_manager.create_session(
@@ -492,7 +512,7 @@ async def restore_session_summary(
     except SessionCapacityError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    await _reset_usage_window_with_hf_baseline(session_id, hf_token)
+    await _reset_usage_window(session_id)
 
     await _check_session_access(
         session_id,
@@ -535,10 +555,9 @@ async def activate_session(
     request: Request,
     user: dict = Depends(get_current_user),
 ) -> SessionInfo:
-    """Mark a session as actively revisited and reset its usage meter window."""
+    """Mark a session as actively revisited without resetting usage."""
     await _check_session_access(session_id, user, request)
-    hf_token = resolve_hf_request_token(request)
-    info = await _reset_usage_window_with_hf_baseline(session_id, hf_token)
+    info = await session_manager.activate_session(session_id)
     if not info:
         raise HTTPException(status_code=404, detail="Session not found")
     return SessionInfo(**info)
@@ -728,7 +747,7 @@ async def get_usage(
             request,
             preload_sandbox=False,
         )
-    return await build_usage_response(
+    usage = await build_usage_response(
         session_manager,
         user_id=user["user_id"],
         hf_token=(
@@ -739,6 +758,16 @@ async def get_usage(
         session_id=session_id,
         timezone_name=tz,
     )
+    if session_id:
+        auto_approval = (
+            await session_manager.reconcile_session_auto_approval_from_usage(
+                session_id,
+                usage,
+            )
+        )
+        if auto_approval is not None:
+            usage["auto_approval"] = auto_approval
+    return usage
 
 
 @router.get("/sessions", response_model=list[SessionInfo])
@@ -755,8 +784,8 @@ async def teardown_session_sandbox(
     """Best-effort sandbox teardown that preserves durable chat history."""
     await _check_session_access(session_id, user, preload_sandbox=False)
     task = asyncio.create_task(session_manager.teardown_sandbox(session_id))
-    _background_teardown_tasks.add(task)
-    task.add_done_callback(_background_teardown_tasks.discard)
+    _background_route_tasks.add(task)
+    task.add_done_callback(_background_route_tasks.discard)
     return {"status": "teardown_requested", "session_id": session_id}
 
 
@@ -906,8 +935,9 @@ async def record_pro_click(
         target=str(body.get("target") or "pro_pricing"),
     )
     if agent_session.session.config.save_sessions:
-        agent_session.session.save_and_upload_detached(
-            agent_session.session.config.session_dataset_repo
+        _schedule_usage_refresh_and_upload(
+            agent_session,
+            error_code="pro_click_billing_snapshot_error",
         )
     return {"status": "ok"}
 
@@ -1150,7 +1180,8 @@ async def submit_feedback(
     # Fire-and-forget save so feedback reaches the dataset even if the user
     # closes the tab right after clicking.
     if agent_session.session.config.save_sessions:
-        agent_session.session.save_and_upload_detached(
-            agent_session.session.config.session_dataset_repo
+        _schedule_usage_refresh_and_upload(
+            agent_session,
+            error_code="feedback_billing_snapshot_error",
         )
     return {"status": "ok"}
